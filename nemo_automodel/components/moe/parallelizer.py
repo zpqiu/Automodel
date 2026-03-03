@@ -119,6 +119,8 @@ def apply_ac(
     if hidden_size is None:
         if hasattr(model, "config") and hasattr(model.config, "hidden_size"):
             hidden_size = model.config.hidden_size
+        elif hasattr(model, "config") and hasattr(model.config, "text_config") and hasattr(model.config.text_config, "hidden_size"):
+            hidden_size = model.config.text_config.hidden_size
         else:
             raise ValueError("hidden_size must be provided or model must have config.hidden_size attribute")
 
@@ -127,9 +129,18 @@ def apply_ac(
         if hasattr(_inner, "moe_config") and hasattr(_inner.moe_config, "n_routed_experts"):
             num_experts = _inner.moe_config.n_routed_experts
         else:
-            for attr in ["num_experts", "moe_num_experts", "n_routed_experts"]:
-                if hasattr(model, "config") and hasattr(model.config, attr):
-                    num_experts = getattr(model.config, attr)
+            # Search in model.config and model.config.text_config (for multimodal models)
+            configs_to_check = []
+            if hasattr(model, "config"):
+                configs_to_check.append(model.config)
+                if hasattr(model.config, "text_config"):
+                    configs_to_check.append(model.config.text_config)
+            for cfg in configs_to_check:
+                for attr in ["num_experts", "moe_num_experts", "n_routed_experts"]:
+                    if hasattr(cfg, attr):
+                        num_experts = getattr(cfg, attr)
+                        break
+                if num_experts is not None:
                     break
             else:
                 raise ValueError("num_experts must be provided or model must have config.num_experts attribute")
@@ -301,6 +312,7 @@ def parallelize_model(
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     mp_policy: MixedPrecisionPolicy | None = None,
+    offload_policy: OffloadPolicy | None = None,
 ):
     assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
         "Tensor parallelism not supported for custom MoE models"
@@ -337,6 +349,7 @@ def parallelize_model(
             ep_shard_enabled=ep_shard_mesh is not None and ep_shard_mesh.size() > 1,
             ep_shard_mesh=ep_shard_mesh,
             mp_policy=mp_policy,
+            offload_policy=offload_policy,
             reshard_after_forward=reshard_after_forward,
             lm_head_precision=lm_head_precision,
             wrap_outer_model=wrap_outer_model,

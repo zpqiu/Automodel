@@ -288,8 +288,14 @@ def instantiate_infrastructure(
     if ep_size > 1:
         from nemo_automodel.components.moe.parallelizer import parallelize_model
 
+        moe_kwargs = moe_config.to_dict()
+        # Propagate offload_policy from distributed_config if not already set in moe_config
+        if moe_kwargs.get("offload_policy") is None and distributed_config is not None:
+            offload_policy = getattr(distributed_config, "offload_policy", None)
+            if offload_policy is not None:
+                moe_kwargs["offload_policy"] = offload_policy
         parallelize_fn = partial(
-            parallelize_model, activation_checkpointing=activation_checkpointing, **moe_config.to_dict()
+            parallelize_model, activation_checkpointing=activation_checkpointing, **moe_kwargs
         )
     elif autopipeline is not None and model_wrapper is not None:
         parallelize_fn = partial(parallelize_for_pp, model_wrapper=model_wrapper)

@@ -655,8 +655,8 @@ class GroupedExpertsDeepEP(nn.Module):
         )
         permuted_probs = permuted_probs.unsqueeze(-1)
 
-        gate_and_up_projs = self.gate_and_up_projs.to_local()
-        down_projs = self.down_projs.to_local()
+        gate_and_up_projs = self.gate_and_up_projs.to_local().to(permuted_local_hidden_states.device)
+        down_projs = self.down_projs.to_local().to(permuted_local_hidden_states.device)
 
         if torch.count_nonzero(tokens_per_expert) > 0:
             if self.use_torch_mm:

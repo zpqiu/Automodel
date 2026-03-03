@@ -105,7 +105,12 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                 layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
                 which = "gate_up_proj" if "gate_and_up_projs" in fqn else "down_proj"
 
-                if device_mesh is not None:
+                if device_mesh is not None and state_dict_utils.is_dtensor(tensor):
+                    # DTensor input (loading path): just rename key and transpose, keep DTensor intact
+                    key = f"{prefix}language_model.layers.{layer_num}.mlp.experts.{which}"
+                    hf_state_dict[key] = tensor.transpose(1, 2).contiguous()
+                elif device_mesh is not None:
+                    # Non-DTensor input with device_mesh (saving path): gather across EP ranks
                     n_experts = self.moe_config.n_routed_experts
                     global_tensor = torch.zeros(
                         (n_experts, tensor.shape[1], tensor.shape[2]),
@@ -113,16 +118,11 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                         device="cpu",
                     )
 
-                    if state_dict_utils.is_dtensor(tensor):
-                        split_weights, expert_ids = state_dict_utils.split_experts_weights_dtensor_aware(
-                            tensor, n_experts
-                        )
-                    else:
-                        start_expert, end_expert = state_dict_utils.get_expert_range_for_rank_from_mesh(
-                            device_mesh, n_experts
-                        )
-                        split_weights = [tensor[i].to(self.dtype).cpu() for i in range(tensor.shape[0])]
-                        expert_ids = list(range(start_expert, end_expert))
+                    start_expert, end_expert = state_dict_utils.get_expert_range_for_rank_from_mesh(
+                        device_mesh, n_experts
+                    )
+                    split_weights = [tensor[i].to(self.dtype).cpu() for i in range(tensor.shape[0])]
+                    expert_ids = list(range(start_expert, end_expert))
 
                     if dist.is_initialized() and "ep" in device_mesh.mesh_dim_names:
                         try:
@@ -207,11 +207,16 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
             )
             if match:
                 _, layer_num, which = match.groups()
-                # HF layout is transposed relative to NeMo (x @ weight), so transpose(1,2)
-                local_tensor = value[start_expert:end_expert].transpose(1, 2).to(self.dtype)
                 native_key = f"{model_prefix}language_model.layers.{layer_num}.mlp.experts."
                 native_key += "gate_and_up_projs" if which == "gate_up_proj" else "down_projs"
-                state_dict[native_key] = state_dict_utils.create_dtensor_from_local(local_tensor, device_mesh, rank)
+
+                if state_dict_utils.is_dtensor(value):
+                    # DTensor input (loading path): just rename key and transpose, keep DTensor intact
+                    state_dict[native_key] = value.transpose(1, 2).contiguous()
+                else:
+                    # Plain tensor input (initial load from HF checkpoint): slice, transpose, wrap as DTensor
+                    local_tensor = value[start_expert:end_expert].transpose(1, 2).to(self.dtype)
+                    state_dict[native_key] = state_dict_utils.create_dtensor_from_local(local_tensor, device_mesh, rank)
                 continue
 
             # Skip quantization scale keys
