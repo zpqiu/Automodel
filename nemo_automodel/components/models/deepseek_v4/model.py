@@ -143,7 +143,7 @@ class DeepseekV4Block(nn.Module):
             padding_mask = attention_mask.bool().logical_not()
 
         # --- Attention site: collapse → norm → attn → expand ---
-        pre, post, comb = self.attn_hc.compute_weights(x)
+        pre, post, comb = self.attn_hc(x)
         collapsed = (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
         attn_out, _ = self.self_attn(
             hidden_states=self.input_layernorm(collapsed),
@@ -153,11 +153,13 @@ class DeepseekV4Block(nn.Module):
             rotary_compress=rotary_compress,
         )
         dtype = x.dtype
-        # Expand: new_stream[h] = post[h] * attn_out + Σ_k comb[h,k] * x[k]
-        x = post.to(dtype).unsqueeze(-1) * attn_out.unsqueeze(-2) + torch.matmul(comb.to(dtype), x)
+        # Expand: native DSV4 uses comb[j, h] * residual[j], i.e. comb.T @ residual.
+        x = post.to(dtype).unsqueeze(-1) * attn_out.unsqueeze(-2) + torch.matmul(
+            comb.transpose(-1, -2).to(dtype), x
+        )
 
         # --- MLP site: same pattern ---
-        pre, post, comb = self.ffn_hc.compute_weights(x)
+        pre, post, comb = self.ffn_hc(x)
         collapsed = (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
         # Hash-routing layers need the current batch's input_ids to do the
         # tid2eid lookup; stash it on the gate just before the MoE call.
@@ -165,7 +167,9 @@ class DeepseekV4Block(nn.Module):
             self.mlp.gate.set_input_ids(input_ids)
         mlp_out = self.mlp(self.post_attention_layernorm(collapsed), padding_mask)
         dtype = x.dtype
-        return post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(comb.to(dtype), x)
+        return post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(
+            comb.transpose(-1, -2).to(dtype), x
+        )
 
     def init_weights(self, buffer_device: torch.device) -> None:
         self.input_layernorm.reset_parameters()
@@ -345,10 +349,15 @@ class DeepseekV4Model(nn.Module):
             head_dim=int(config.head_dim),
             partial_rotary_factor=partial_rotary_factor,
         )
+        rope_scaling = getattr(config, "rope_scaling", None) or {}
         self.rotary_emb_compress = DeepseekV4RotaryEmbedding(
             rope_theta=float(getattr(config, "compress_rope_theta", 160000.0) or 160000.0),
             head_dim=int(config.head_dim),
             partial_rotary_factor=partial_rotary_factor,
+            original_max_position_embeddings=int(rope_scaling.get("original_max_position_embeddings", 0) or 0),
+            rope_factor=float(rope_scaling.get("factor", 1.0) or 1.0),
+            beta_fast=int(rope_scaling.get("beta_fast", 32) or 32),
+            beta_slow=int(rope_scaling.get("beta_slow", 1) or 1),
         )
 
     def forward(
