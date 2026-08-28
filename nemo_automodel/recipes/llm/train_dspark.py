@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DSpark draft-model training recipe (Qwen3, Gemma4, DeepSeek V4, GLM-5.2, and MiniMax M3 VL targets).
+"""DSpark draft-model training recipe for the supported text and multimodal targets.
 
 DSpark is a semi-autoregressive parallel drafter: a parallel backbone produces a
 block of tokens per anchor in one pass, a serial Markov head injects intra-block
@@ -76,6 +76,7 @@ from nemo_automodel.components.optim.optimizer import build_optimizer
 from nemo_automodel.components.speculative.dspark.common import validate_target_layer_ids
 from nemo_automodel.components.speculative.dspark.config import (
     build_deepseek_v4_draft_config,
+    build_draft_config,
     build_gemma4_draft_config,
     build_glm_5_2_draft_config,
     build_kimi_k3_draft_config,
@@ -501,7 +502,7 @@ class _DSparkMetricWindow:
 
 
 class TrainDSparkRecipe(BaseRecipe):
-    """Recipe for DSpark draft-model training on Qwen3, Gemma4, DeepSeek V4, GLM-5.2, and MiniMax M3 VL targets."""
+    """Recipe for DSpark draft-model training on supported causal and multimodal targets."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -626,7 +627,7 @@ class TrainDSparkRecipe(BaseRecipe):
             ):
                 raise NotImplementedError(
                     "Context parallelism (cp_size>1) is only supported for the dense Qwen3-style DSpark "
-                    "target; the DeepSeek V4 / GLM-5.2 / Gemma4 / MiniMax M3 / Kimi K3 targets already "
+                    "target; the large MoE/VLM targets already "
                     "run under their own expert-parallel / FSDP mesh. Set cp_size=1 for those."
                 )
             # The CP hook intercepts the target's F.scaled_dot_product_attention call, so
@@ -660,6 +661,7 @@ class TrainDSparkRecipe(BaseRecipe):
             _apply_target_chat_template(self.tokenizer, chat_template)
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
 
+        model_owned_dspark_draft_kind = None
         if is_deepseek_v4_target:
             if self.cached_target_path is None:
                 # Full V4-Flash target loaded with the same expert-parallel / FSDP and
@@ -799,10 +801,54 @@ class TrainDSparkRecipe(BaseRecipe):
             architectures = ["KimiK3ForCausalLM"]
         else:
             target_config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
-            architectures = getattr(target_config, "architectures", []) or []
-            is_gemma4_target = getattr(target_config, "model_type", "") in _GEMMA4_MODEL_TYPES
+            model_owned_dspark_builder = getattr(target_config, "build_dspark_target", None)
+            if callable(model_owned_dspark_builder):
+                if cp_size > 1:
+                    raise NotImplementedError(
+                        "Context parallelism (cp_size>1) is not supported for targets that own a distributed "
+                        "DSpark build; set cp_size=1 for the target's expert-parallel / FSDP mesh."
+                    )
+                architectures = list(getattr(target_config, "dspark_draft_architectures", ()))
+                model_owned_dspark_draft_kind = str(getattr(target_config, "dspark_draft_config_kind", ""))
+                if not architectures or not model_owned_dspark_draft_kind:
+                    raise ValueError(
+                        f"{type(target_config).__name__}.build_dspark_target must declare "
+                        "dspark_draft_architectures and dspark_draft_config_kind."
+                    )
+                if self.cached_target_path is None:
+                    self.distributed_setup = create_distributed_setup_from_config(
+                        self.cfg,
+                        world_size=self.dist_env.world_size,
+                    )
+                    target_config, self.target_model = model_owned_dspark_builder(
+                        target_path=target_path,
+                        distributed_setup=self.distributed_setup,
+                        device=self.device,
+                        compute_dtype=self.compute_dtype,
+                        target_num_hidden_layers=recipe_cfg.get("target_num_hidden_layers", None),
+                        target_attn_backend=str(recipe_cfg.get("target_attn_backend", "flex")),
+                        target_dispatcher=str(recipe_cfg.get("target_dispatcher", "hybridep")),
+                        target_experts=str(recipe_cfg.get("target_experts", "torch_mm")),
+                        target_enable_fsdp_optimizations=bool(recipe_cfg.get("target_enable_fsdp_optimizations", True)),
+                        trust_remote_code=trust_remote_code,
+                    )
+                else:
+                    prepare_target_config = getattr(target_config, "prepare_dspark_target_config", None)
+                    if not callable(prepare_target_config):
+                        raise ValueError(
+                            f"{type(target_config).__name__}.build_dspark_target requires "
+                            "prepare_dspark_target_config for offline cached training."
+                        )
+                    _, target_config = prepare_target_config(
+                        target_path=target_path,
+                        target_num_hidden_layers=recipe_cfg.get("target_num_hidden_layers", None),
+                    )
+                    self.target_model = None
+            else:
+                architectures = getattr(target_config, "architectures", []) or []
+                is_gemma4_target = getattr(target_config, "model_type", "") in _GEMMA4_MODEL_TYPES
 
-            if self.cached_target_path is None:
+            if self.cached_target_path is None and not callable(model_owned_dspark_builder):
                 target_attn_implementation = recipe_cfg.get("target_attn_implementation", None)
                 target_kwargs = {}
                 if target_attn_implementation is not None:
@@ -829,7 +875,7 @@ class TrainDSparkRecipe(BaseRecipe):
                 )
                 if self.distributed_setup is None:
                     self.target_model.to(self.device)
-            else:
+            elif not callable(model_owned_dspark_builder):
                 self.target_model = None
         if self.target_model is not None:
             self.target_model.requires_grad_(False)
@@ -974,7 +1020,14 @@ class TrainDSparkRecipe(BaseRecipe):
         confidence_head_alpha = float(recipe_cfg.get("confidence_head_alpha", 1.0))
         markov_rank = int(recipe_cfg.get("markov_rank", 256))
 
-        if is_deepseek_v4_target or is_glm_5_2_target or is_gemma4_target or is_minimax_m3_target or is_kimi_k3_target:
+        if (
+            is_deepseek_v4_target
+            or is_glm_5_2_target
+            or is_gemma4_target
+            or is_minimax_m3_target
+            or is_kimi_k3_target
+            or model_owned_dspark_draft_kind is not None
+        ):
             # Gemma4, DeepSeek V4, GLM-5.2, MiniMax M3, and Kimi K3 drafts share one typed
             # draft-config builder that takes the same DSpark model-args bundle.
             margs = _DraftArgs(
@@ -998,6 +1051,12 @@ class TrainDSparkRecipe(BaseRecipe):
                 draft_config_obj = build_glm_5_2_draft_config(target_config, margs)
             elif is_kimi_k3_target:
                 draft_config_obj = build_kimi_k3_draft_config(target_config, margs)
+            elif model_owned_dspark_draft_kind is not None:
+                if model_owned_dspark_draft_kind != "dense":
+                    raise ValueError(
+                        f"Unsupported model-owned DSpark draft config kind: {model_owned_dspark_draft_kind!r}."
+                    )
+                draft_config_obj = build_draft_config(target_config, margs)
             elif is_minimax_m3_target:
                 # MiniMax M3 draft is built from the target's text sub-config (text_config).
                 draft_config_obj = build_minimax_m3_draft_config(target_config, margs)

@@ -1,0 +1,89 @@
+# DSpark training for the language-only Qwen3.8-Flash-Next 180B target.
+#
+# The released checkpoint uses the legacy qwen4_exp identifiers and contains a
+# vision shell, but AutoModel loads only its text backbone here. The 512 routed
+# experts and the 51.2B-parameter PLE table are owner-sharded over 16 GPUs.
+#
+# Hardware target: 2 nodes x 8 GPUs (interactive partition maximum), EP16.
+# The PLE owner count and ep_size must both divide the checkpoint's 128 physical
+# Engram shards / 512 routed experts. On the validated cluster, also export:
+#   NCCL_NET_PLUGIN=none
+#   NCCL_NET=IB
+
+recipe: TrainDSparkRecipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+wandb:
+  enable: false
+  project: qwen3-8-flash-next-dspark
+  group: perfectblend-direct
+  tags: [dspark, qwen3-8-flash-next, hybridep]
+
+distributed:
+  strategy: fsdp2
+  defer_fsdp_grad_sync: true
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 16
+  activation_checkpointing: false
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+
+recipe_args:
+  target_model_name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/shuangy/models/brightdelta-real/brightdelta-180b-bf16/brightdelta-180b-bf16_vv2
+  train_data_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/sd/datasets/open-perfectblend-direct-clean
+  train_split: "train[4096:]"
+  val_data_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/sd/datasets/open-perfectblend-direct-clean
+  val_split: "train[:4096]"
+  output_dir: ./outputs/dspark_qwen3_8_flash_next_180b
+  seq_length: 4096
+  micro_batch_size: 1
+  grad_accumulation_steps: 32
+  num_workers: 2
+  num_epochs: 10
+  ckpt_every_steps: 500
+  save_checkpoint_every_epoch: true
+
+  draft_num_hidden_layers: 5
+  block_size: 7
+  num_anchors: 512
+  mask_token_id: 248319
+  target_layer_ids: [6, 16, 26, 36, 46]
+  freeze_embeddings: true
+  attention_backend: flex_attention
+
+  target_attn_backend: flex
+  target_dispatcher: hybridep
+  target_experts: torch_mm
+  target_enable_fsdp_optimizations: true
+
+  markov_rank: 256
+  markov_head_type: vanilla
+  confidence_head_alpha: 1.0
+  confidence_head_with_markov: true
+  ce_loss_alpha: 0.1
+  l1_loss_alpha: 0.9
+  loss_decay_gamma: 4.0
+
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 10
+  max_grad_norm: 1.0
+
+optimizer:
+  lr: 6.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  warmup_ratio: 0.04
+  min_lr_ratio: 0.1
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/dspark_qwen3_8_flash_next_180b/checkpoints
+  model_save_format: safetensors
+  save_consolidated: final

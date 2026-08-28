@@ -16,9 +16,17 @@
 
 from __future__ import annotations
 
-from typing import Any
+import copy
+import logging
+from typing import TYPE_CHECKING, Any
 
+import torch
 from transformers.configuration_utils import PretrainedConfig
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.config import DistributedSetup
+
+logger = logging.getLogger(__name__)
 
 
 class Qwen3_8_FlashNextTextConfig(PretrainedConfig):
@@ -306,6 +314,8 @@ class Qwen3_8_FlashNextConfig(PretrainedConfig):
     architectures = ["Qwen3_8_FlashNextForConditionalGeneration"]
     sub_configs = {"text_config": Qwen3_8_FlashNextTextConfig, "vision_config": Qwen3_8_FlashNextVisionConfig}
     keys_to_ignore_at_inference = ["past_key_values"]
+    dspark_draft_architectures: tuple[str, ...] = ("Qwen3ForCausalLM",)
+    dspark_draft_config_kind: str = "dense"
 
     def __init__(
         self,
@@ -355,6 +365,123 @@ class Qwen3_8_FlashNextConfig(PretrainedConfig):
             architectures=architectures or ["Qwen3_8_FlashNextForConditionalGeneration"],
             **kwargs,
         )
+
+    def prepare_dspark_target_config(
+        self,
+        *,
+        target_path: str,
+        target_num_hidden_layers: int | None,
+    ) -> tuple[Qwen3_8_FlashNextConfig, Qwen3_8_FlashNextTextConfig]:
+        """Create an independent language-only config for a DSpark target.
+
+        The optional layer reduction is diagnostic-only. It must retain every
+        released PLE owner layer so checkpoint loading keeps the model contract.
+
+        Returns:
+            Pair containing an independent outer checkpoint config and its text config.
+        """
+        target_config = copy.deepcopy(self)
+        target_config.language_model_only = True
+        target_config.name_or_path = target_path
+        text_config = target_config.text_config
+        if target_num_hidden_layers is None:
+            return target_config, text_config
+
+        checkpoint_num_layers = int(text_config.num_hidden_layers)
+        num_hidden_layers = int(target_num_hidden_layers)
+        if num_hidden_layers < 1 or num_hidden_layers > checkpoint_num_layers:
+            raise ValueError(
+                f"target_num_hidden_layers={num_hidden_layers} must be in [1, {checkpoint_num_layers}] "
+                "(the checkpoint's depth)."
+            )
+        missing_ple_layers = [layer_id for layer_id in text_config.ple_layer_ids if int(layer_id) > num_hidden_layers]
+        if missing_ple_layers:
+            raise ValueError(
+                f"target_num_hidden_layers={num_hidden_layers} removes required PLE layers {missing_ple_layers}; "
+                f"use at least {max(text_config.ple_layer_ids)} layers."
+            )
+        logger.warning(
+            "Reducing the Qwen3.8-Flash-Next target from %d to %d layers "
+            "(target_num_hidden_layers): diagnostic/CI only, not a usable drafter.",
+            checkpoint_num_layers,
+            num_hidden_layers,
+        )
+        if text_config.layer_types is None:
+            layer_types = [
+                "full_attention" if layer_type == "attention" else layer_type
+                for layer_type in text_config.layers_block_type
+            ]
+        else:
+            layer_types = list(text_config.layer_types)
+        text_config.num_hidden_layers = num_hidden_layers
+        text_config.layer_types = layer_types[:num_hidden_layers]
+        return target_config, text_config
+
+    def build_dspark_target(
+        self,
+        *,
+        target_path: str,
+        distributed_setup: DistributedSetup,
+        device: torch.device,
+        compute_dtype: torch.dtype,
+        target_num_hidden_layers: int | None,
+        target_attn_backend: str,
+        target_dispatcher: str,
+        target_experts: str,
+        target_enable_fsdp_optimizations: bool,
+        trust_remote_code: bool,
+    ) -> tuple[Qwen3_8_FlashNextTextConfig, torch.nn.Module]:
+        """Build the language-only Qwen target through the EP/FSDP path.
+
+        Args:
+            target_path: Released checkpoint directory or Hugging Face identifier.
+            distributed_setup: Runtime device mesh and parallelization policy.
+            device: Resolved target device; CUDA is required by the distributed MoE path.
+            compute_dtype: Parameter and compute dtype used while loading the frozen target.
+            target_num_hidden_layers: Optional diagnostic-only decoder-depth reduction.
+            target_attn_backend: Backend name for QSA attention layers.
+            target_dispatcher: Backend name for routed-token dispatch.
+            target_experts: Backend name for routed expert computation.
+            target_enable_fsdp_optimizations: Whether to enable FSDP load optimizations.
+            trust_remote_code: Whether checkpoint loading may execute remote modeling code.
+
+        Returns:
+            Pair containing the text config and distributed target module.
+        """
+        if device.type != "cuda":
+            raise RuntimeError(
+                "Qwen3.8-Flash-Next DSpark target requires CUDA: the target is loaded "
+                "with the expert-parallel / FSDP distributed path."
+            )
+
+        from nemo_automodel._transformers import NeMoAutoModelForCausalLM
+        from nemo_automodel.components.models.common import BackendConfig
+
+        target_config, text_config = self.prepare_dspark_target_config(
+            target_path=target_path,
+            target_num_hidden_layers=target_num_hidden_layers,
+        )
+        backend = BackendConfig(
+            attn=target_attn_backend,
+            linear="torch",
+            rms_norm="torch_fp32",
+            experts=target_experts,
+            dispatcher=target_dispatcher,
+            rope_fusion=False,
+            fake_balanced_gate=False,
+            gate_precision="float32",
+            enable_hf_state_dict_adapter=True,
+            enable_fsdp_optimizations=target_enable_fsdp_optimizations,
+        )
+        target_model = NeMoAutoModelForCausalLM.from_config(
+            config=target_config,
+            backend=backend,
+            distributed_setup=distributed_setup,
+            load_base_model=True,
+            torch_dtype=compute_dtype,
+            trust_remote_code=trust_remote_code,
+        )
+        return text_config, target_model
 
 
 class Qwen3_8_FlashNextLegacyTextConfig(Qwen3_8_FlashNextTextConfig):

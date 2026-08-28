@@ -406,6 +406,21 @@ class Qwen3_8_FlashNextHyperConnection(nn.Module):
         residual = Qwen3_8_FlashNextHyperConnectionResidual(hidden_states, normalized)
         return mixed, residual
 
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, Qwen3_8_FlashNextHyperConnectionResidual]:
+        """Collapse HC streams through the standard module call path.
+
+        Args:
+            hidden_states: Tensor of shape ``[..., hc_stream]``, with arbitrary
+                leading dimensions and flattened HC width
+                ``hc_stream = hc_count * hidden_size``.
+
+        Returns:
+            Pair containing a tensor of shape ``[..., hidden_size]`` with the same
+            leading dimensions and residual state whose tensors each have shape
+            ``[..., hc_stream]``.
+        """
+        return self.mix(hidden_states)
+
     def combine(
         self,
         block_output: torch.Tensor,

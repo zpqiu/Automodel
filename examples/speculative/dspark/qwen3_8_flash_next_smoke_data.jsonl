@@ -1,0 +1,8 @@
+{"id": 0, "messages": [{"role": "user", "content": "State one fact about zero."}, {"role": "assistant", "content": "Zero is the additive identity."}]}
+{"id": 1, "messages": [{"role": "user", "content": "State one fact about one."}, {"role": "assistant", "content": "One is the multiplicative identity."}]}
+{"id": 2, "messages": [{"role": "user", "content": "Name a primary color."}, {"role": "assistant", "content": "Blue is a primary color in the RGB model."}]}
+{"id": 3, "messages": [{"role": "user", "content": "What freezes at zero Celsius?"}, {"role": "assistant", "content": "Pure water freezes near zero degrees Celsius at standard pressure."}]}
+{"id": 4, "messages": [{"role": "user", "content": "Give a short greeting."}, {"role": "assistant", "content": "Hello, and welcome."}]}
+{"id": 5, "messages": [{"role": "user", "content": "Name Earth's natural satellite."}, {"role": "assistant", "content": "Earth's natural satellite is the Moon."}]}
+{"id": 6, "messages": [{"role": "user", "content": "What gas do plants absorb?"}, {"role": "assistant", "content": "Plants absorb carbon dioxide during photosynthesis."}]}
+{"id": 7, "messages": [{"role": "user", "content": "Complete: two plus two."}, {"role": "assistant", "content": "Two plus two equals four."}]}

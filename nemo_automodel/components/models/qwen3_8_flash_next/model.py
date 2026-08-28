@@ -241,6 +241,33 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
         """
         self.embed_tokens = value
 
+    def get_dspark_final_hidden_module(self) -> nn.Module:
+        """Return the final HC mixer whose first output feeds the LM head."""
+        return self.hyper_connection_mixer
+
+    def prepare_dspark_hidden_state(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Collapse a captured HC decoder state to the DSpark feature width.
+
+        Args:
+            hidden_states: Tensor of shape ``[batch, sequence, hc_count * hidden_size]``
+                with HC streams flattened into the last axis for an intermediate
+                decoder state, or ``[batch, sequence, hidden_size]`` for the final
+                HC-mixed state.
+
+        Returns:
+            Tensor of shape ``[batch, sequence, hidden_size]``.
+        """
+        hidden_size = int(self.config.hidden_size)
+        if hidden_states.shape[-1] == hidden_size:
+            return hidden_states
+        expected_width = int(self.config.hc_count) * hidden_size
+        if hidden_states.shape[-1] != expected_width:
+            raise ValueError(
+                f"Expected a Qwen3.8-Flash-Next hidden width of {hidden_size} or {expected_width}, "
+                f"got {hidden_states.shape[-1]}."
+            )
+        return hidden_states.unflatten(-1, (self.config.hc_count, hidden_size)).mean(dim=-2)
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -386,7 +413,7 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
             if captured_states is not None:
                 captured_states.append(hidden_states)
 
-        hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
+        hidden_states, _ = self.hyper_connection_mixer(hidden_states)
         if captured_states is not None:
             captured_states.append(hidden_states)
         return BaseModelOutputWithPast(

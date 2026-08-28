@@ -119,22 +119,29 @@ class HFDSparkTargetModel:
     def _get_final_norm(self) -> nn.Module:
         """Return the final norm module whose output feeds ``lm_head``."""
         inner = self._inner_model()
+        get_final_hidden_module = getattr(inner, "get_dspark_final_hidden_module", None)
+        if get_final_hidden_module is not None:
+            return get_final_hidden_module()
         norm = getattr(inner, "norm", None)
         if norm is None:
             raise ValueError("Could not locate the target's final norm for last-hidden capture")
         return norm
 
     def _collapse_hc_streams(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Collapse a 4D Hyper-Connection stream ``[B, S, hc_mult, H]`` to ``[B, S, H]``.
+        """Collapse a model-owned or 4D HC stream to ``[batch, sequence, hidden]``.
 
-        DeepSeek V4 decoder layers emit ``hc_mult`` parallel residual copies; only the
-        final-norm output is already collapsed. For an intermediate target-feature
-        layer we reduce the streams with their mean: a simple, in-distribution
-        reduction that the draft's learnable ``fc`` then reprojects. We deliberately
-        avoid the model's final ``hc_head`` here, since it is trained for the
-        last-layer stream distribution, not the intermediate ones. Non-HC targets
-        emit 3D states and pass through unchanged.
+        Args:
+            tensor: Captured hidden state. Model-owned adapters document their own
+                accepted layout; the generic fallback accepts a tensor of shape
+                ``[batch, sequence, hc_count, hidden]`` or ``[batch, sequence, hidden]``.
+
+        Returns:
+            Tensor of shape ``[batch, sequence, hidden]``.
         """
+        inner = self._inner_model()
+        prepare_hidden_state = getattr(inner, "prepare_dspark_hidden_state", None)
+        if prepare_hidden_state is not None:
+            return prepare_hidden_state(tensor)
         if tensor.ndim != 4:
             return tensor
         return tensor.mean(dim=2)
